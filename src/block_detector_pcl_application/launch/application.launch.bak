@@ -1,0 +1,126 @@
+<launch>
+  <arg name="marker_size" default="12.0" />
+  <arg name="max_new_marker_error" default="0.08" />
+  <arg name="max_track_error" default="0.2" />
+  <arg name="cam_image_topic" default="/camera/rgb/image_raw" />
+  <arg name="cam_info_topic" default="/camera/rgb/camera_info" />
+  <arg name="output_frame" default="camera_link" />
+  <arg name="ar_marker_base_link_frame" default="ar_marker_0" />
+  <arg name="point_cloud_pass_through_max" default="2.0" />
+
+  <env name="ROSCONSOLE_CONFIG_FILE" value="$(find block_detector_pcl_application)/rosconsole.conf" />
+
+  <machine name="cimaster" address="cimaster" />
+  <machine name="DL_PC" address="localhost" />
+
+  <param name="robot_description"
+    command="$(find xacro)/xacro --inorder '$(find crane_x7_description)/urdf/crane_x7.urdf.xacro'"
+    />
+  <group ns="crane_x7">
+    <rosparam file="$(find crane_x7_control)/config/crane_x7_control.yaml" command="load"/>
+
+    <node name="controller_manager"
+        pkg="controller_manager"
+        type="spawner" respawn="false"
+        output="screen"
+        args="joint_state_controller
+              arm_controller
+              gripper_controller"
+        machine="cimaster" />
+
+    <node name="crane_x7_control" pkg="crane_x7_control" type="crane_x7_control" output="screen" respawn="false" machine="cimaster">
+      <rosparam file="$(find crane_x7_control)/config/crane_x7_control.yaml" command="load"/>
+    </node>
+
+    <node name="robot_state_publisher" pkg="robot_state_publisher"
+        type="robot_state_publisher" respawn="false" output="screen" machine="cimaster">
+      <remap from="/joint_states" to="/crane_x7/joint_states" />
+    </node>
+  </group>
+
+  <node name="ar_track_alvar" pkg="ar_track_alvar" type="individualMarkersNoKinect" respawn="false" output="screen" machine="DL_PC">
+    <param name="marker_size"           type="double" value="$(arg marker_size)" />
+    <param name="max_new_marker_error"  type="double" value="$(arg max_new_marker_error)" />
+    <param name="max_track_error"       type="double" value="$(arg max_track_error)" />
+    <param name="output_frame"          type="string" value="$(arg output_frame)" />
+
+    <remap from="camera_image"  to="$(arg cam_image_topic)" />
+    <remap from="camera_info"   to="$(arg cam_info_topic)" />
+  </node>
+
+  <node pkg="tf" type="static_transform_publisher" name="base_link_marker_to_base_link" args="0 -0.30 0 0 0 0 $(arg ar_marker_base_link_frame) base_link 100" machine="DL_PC" />
+  <node pkg="tf" type="static_transform_publisher" name="base_link_to_back_of_base_link" args="0 -0.10 0 0 0 0 base_link back_of_base_link 100" machine="DL_PC" />
+
+  <node pkg="nodelet" type="nodelet" name="pcl_manager" args="manager" output="screen" machine="DL_PC" />
+
+  <node pkg="nodelet" type="nodelet" name="voxel_grid" args="load pcl/VoxelGrid pcl_manager" output="screen" machine="DL_PC">
+    <remap from="~input" to="/camera/depth_registered/points" />
+    <rosparam>
+      filter_field_name: z
+      filter_limit_min: 0.86
+      filter_limit_max: 2.25
+      filter_limit_negative: False
+      leaf_size: 0.01
+    </rosparam>
+  </node>
+    
+  <node pkg="nodelet" type="nodelet" name="normal_estimation" args="load pcl/NormalEstimation pcl_manager" output="screen" machine="DL_PC">
+    <remap from="~input" to="/voxel_grid/output" />
+    <rosparam>
+      k_search: 0
+      radius_search: 0.015
+      spatial_locator: 0
+    </rosparam>
+  </node>
+
+  <node pkg="nodelet" type="nodelet" name="planar_segmentation" args="load pcl/SACSegmentationFromNormals pcl_manager" output="screen" machine="DL_PC">
+    <remap from="~input"   to="/voxel_grid/output" />
+    <remap from="~normals" to="/normal_estimation/output" />
+    <rosparam>
+      model_type: 11
+      distance_threshold: 0.1
+      max_iterations: 1000
+      method_type: 0
+      optimize_coefficients: true
+      normal_distance_weight: 0.1
+      eps_angle: 0.09
+    </rosparam>
+  </node>
+
+  <node pkg="nodelet" type="nodelet" name="extract_plane_indices" args="load pcl/ExtractIndices pcl_manager" output="screen" machine="DL_PC">
+    <remap from="~input"   to="/voxel_grid/output" />
+    <remap from="~indices" to="/planar_segmentation/inliers" />
+    <rosparam>
+      negative: true
+      approximate_sync: true
+    </rosparam>
+  </node>
+
+  <node pkg="nodelet" type="nodelet" name="statistical_outlier_removal" args="load pcl/StatisticalOutlierRemoval pcl_manager" output="screen" machine="DL_PC">
+    <remap from="~input" to="/extract_plane_indices/output" />
+    <rosparam>
+      mean_k: 10
+      stddev: 2
+    </rosparam>
+  </node>
+
+  <node name="clamp_filter" pkg="frame_radius_subtractor" type="frame_radius_subtractor_node" output="screen" machine="DL_PC">
+    <param name="use_rgb" type="bool" value="false" />
+    <param name="base_frame" type="string" value="camera_rgb_optical_frame" />
+    <param name="subtraction_frame" type="string" value="back_of_base_link" />
+    <param name="radius" type="double" value="0.25" />
+    <remap from="~cloud_in" to="/statistical_outlier_removal/output" />
+  </node> 
+
+  <node name="robot_self_filter" pkg="robot_self_filter" type="self_filter" machine="cimaster">
+    <rosparam command="load" file="$(find block_detector_pcl_application)/links.yaml" />
+    <param name="use_rgb" type="bool" value="false" />
+    <param name="self_see_default_padding" type="double" value="0.04" />
+    <remap from="cloud_in" to="/clamp_filter/output" />
+  </node>
+
+  <node name="euclidean_clustering" pkg="euclidean_clustering" type="euclidean_clustering_node" output="screen" machine="DL_PC">
+    <param name="use_rgb" type="bool" value="false" />
+    <remap from="cloud_in" to="/cloud_out" />
+  </node>
+</launch>
